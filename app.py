@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 # ============ CẤU HÌNH — sửa ở đây nếu team thay đổi ============
-TEAM = ["Mạnh", "Gấu", "Trà", "Cá"]
+TEAM = ["Manh", "Gấu", "Chà", "Cá"]
 REMIND_DAYS = 3  # số ngày giữa các lần nhắc lại
 # ==================================================================
 
@@ -344,6 +344,11 @@ def lead_table(df, key, hide=()):
                    on_change=on_table_edit, args=(editor_key, ids))
 
 
+def opts(cur, lst):
+    """Danh sách lựa chọn luôn chứa giá trị hiện tại (kể cả giá trị ngoài danh sách chuẩn)."""
+    return [""] + lst + ([cur] if cur and cur not in lst else [])
+
+
 def detail_form(df, key):
     """Sửa đầy đủ thông tin 1 lead (các trường như file Excel cũ)."""
     if df.empty:
@@ -364,9 +369,9 @@ def detail_form(df, key):
             v["email"] = c1.text_input("Email", r.email)
             v["phone"] = c2.text_input("Điện thoại", r.phone)
             c3, c4, c5 = st.columns(3)
-            v["model"] = c3.selectbox("Business model", [""] + MODELS, index=([""] + MODELS).index(r.model) if r.model in MODELS else 0)
-            v["size"] = c4.selectbox("Quy mô", [""] + SIZES, index=([""] + SIZES).index(r["size"]) if r["size"] in SIZES else 0)
-            v["domain"] = c5.selectbox("Ngành", [""] + DOMAINS, index=([""] + DOMAINS).index(r.domain) if r.domain in DOMAINS else 0)
+            v["model"] = c3.selectbox("Business model", opts(r["model"], MODELS), index=opts(r["model"], MODELS).index(r["model"]))
+            v["size"] = c4.selectbox("Quy mô", opts(r["size"], SIZES), index=opts(r["size"], SIZES).index(r["size"]))
+            v["domain"] = c5.selectbox("Ngành", opts(r["domain"], DOMAINS), index=opts(r["domain"], DOMAINS).index(r["domain"]))
             v["signal"] = c1.text_input("Signal", r.signal)
             v["offer"] = c2.text_input("Offer", r.offer)
             v["milestones"] = st.text_area("Milestones (DD/MM/YYYY: chuyện gì đã xảy ra)", r.milestones, height=80)
