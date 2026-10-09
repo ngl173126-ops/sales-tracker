@@ -133,6 +133,12 @@ class SheetStore:
         if data:
             self.ws.batch_update(data, value_input_option="RAW")
 
+    def delete(self, lead_ids):
+        ids = self.ws.col_values(self.header.index("id") + 1)
+        rows = sorted((ids.index(l) + 1 for l in lead_ids if l in ids), reverse=True)
+        for r in rows:  # xoá từ dưới lên để số dòng không bị lệch
+            self.ws.delete_rows(r)
+
 
 class LocalStore:
     """Chế độ thử: lưu vào leads_local.csv cạnh app.py."""
@@ -158,6 +164,10 @@ class LocalStore:
                 for k, v in fields.items():
                     df.at[lid, k] = v
         self._save(df.reset_index())
+
+    def delete(self, lead_ids):
+        df = normalize(self.load())
+        self._save(df[~df.id.isin(lead_ids)])
 
 
 @st.cache_resource
@@ -270,12 +280,34 @@ def norm_linkedin(url):
     return u
 
 
+def li_key(url):
+    """Khoá so trùng: phần /in/<tên> của link LinkedIn, không phân biệt hoa thường, đã giải mã %xx."""
+    from urllib.parse import unquote
+    m = re.search(r"linkedin\.com/in/([^/?#\s]+)", unquote(url or "").lower())
+    return m.group(1).strip("/") if m else ""
+
+
+def who(r):
+    return f"{r['name'] or '(chưa có tên)'} – {r['company'] or '(chưa có công ty)'} (PIC: {r['pic'] or 'chưa chia'})"
+
+
+def find_dup(df, url, exclude_id=None):
+    """Trả về dòng lead khác đang dùng cùng link LinkedIn, hoặc None."""
+    k = li_key(url)
+    if not k:
+        return None
+    for _, r in df.iterrows():
+        if r["id"] != exclude_id and li_key(r["linkedin"]) == k:
+            return r
+    return None
+
+
 # ---------------- Bảng lead (tick là lưu) ----------------
 def on_table_edit(editor_key, ids):
     edits = st.session_state[editor_key]["edited_rows"]
     rows = load_df().set_index("id")
     today = date.today().isoformat()
-    changes, ticked = {}, []
+    changes, ticked, warns = {}, [], []
     for idx, cols in edits.items():
         lid = ids[int(idx)]
         if lid not in rows.index:
@@ -295,13 +327,21 @@ def on_table_edit(editor_key, ids):
                 field = TEXT_COLS[col]
                 if field == "linkedin":
                     val = norm_linkedin(val or "")
+                    d = find_dup(rows.reset_index(), val, exclude_id=lid)
+                    if d is not None:
+                        warns.append(f"Link LinkedIn của {cur['name'] or cur['company']} đã có ở: {who(d)}. Không lưu link này.")
+                        continue
                 ch[field] = (val or "").strip()
                 if field == "detail" and ch[field] in DETAIL_STAGE:
                     ch["stage"] = DETAIL_STAGE[ch[field]]
         if ch:
             ch["last_action"] = today
             changes[lid] = ch
-    save_changes(changes, ("Đã tick: " + ", ".join(ticked)) if ticked else "Đã lưu.")
+    if warns:
+        st.session_state.dup_warn = warns
+        st.session_state.ver = st.session_state.get("ver", 0) + 1
+    if changes:
+        save_changes(changes, ("Đã tick: " + ", ".join(ticked)) if ticked else "Đã lưu.")
 
 
 def lead_table(df, key, hide=()):
@@ -386,12 +426,33 @@ def detail_form(df, key):
                 ch = {k: (val.strip() if isinstance(val, str) else val) for k, val in v.items() if val != r[k]}
                 if "linkedin" in ch:
                     ch["linkedin"] = norm_linkedin(ch["linkedin"])
+                    d = find_dup(df_all(), ch["linkedin"], exclude_id=lid)
+                    if d is not None:
+                        st.error(f"⚠️ Link LinkedIn này đã có ở: {who(d)}. Chưa lưu — kiểm tra lại link.")
+                        ch = {}
                 if "detail" in ch:
                     ch["stage"] = DETAIL_STAGE[ch["detail"]]
                 if ch:
                     ch["last_action"] = date.today().isoformat()
                     save_changes({lid: ch}, "Đã lưu thông tin lead.")
                     st.rerun()
+        d1, d2 = st.columns([3, 1])
+        sure = d1.checkbox(f"Tôi muốn xoá hẳn lead **{labels[lid]}**", key=f"{key}_del_{lid}")
+        if d2.button("Xoá lead", key=f"{key}_delbtn_{lid}", type="secondary", disabled=not sure,
+                     icon=":material/delete:", width="stretch"):
+            delete_leads([lid], f"Đã xoá {labels[lid]}.")
+            st.rerun()
+
+
+def df_all():
+    return load_df()
+
+
+def delete_leads(lead_ids, msg):
+    get_store().delete(list(lead_ids))
+    load_df.clear()
+    st.session_state.ver = st.session_state.get("ver", 0) + 1
+    st.session_state.flash = msg
 
 
 def random_split(ids, members):
@@ -424,6 +485,8 @@ if pw and not st.session_state.get("authed"):
 
 if "flash" in st.session_state:
     st.toast(st.session_state.pop("flash"), icon=":material/check_circle:")
+for w in st.session_state.pop("dup_warn", []):
+    st.error("⚠️ " + w)
 
 try:
     df = load_df()
@@ -439,7 +502,7 @@ with st.sidebar:
     if me and me != qp_me:
         st.query_params["me"] = me
     page = st.radio("Trang", [":material/person: Lead của tôi", ":material/search: Tra công ty",
-                              ":material/add_link: Thêm lead LinkedIn", ":material/groups: Cả team"],
+                              ":material/person_add: Thêm lead", ":material/groups: Cả team"],
                     label_visibility="collapsed")
     if me:
         st.caption(f"Mẹo: lưu lại link trang này, lần sau mở là vào thẳng danh sách của {me}.")
@@ -456,8 +519,16 @@ with st.sidebar:
 today = date.today()
 df = df.copy()
 df["_due"] = [next_due(r) for _, r in df.iterrows()]
+# Cảnh báo link LinkedIn bị trùng trong dữ liệu (vd. ai đó dán thẳng vào Google Sheet)
+_k = df.linkedin.map(li_key)
+dups = df[(_k != "") & _k.duplicated(keep=False)].assign(_k=_k).sort_values("_k")
+if not dups.empty:
+    with st.expander(f"⚠️ Có {dups._k.nunique()} link LinkedIn bị trùng ({len(dups)} dòng) — bấm để xem", expanded=False):
+        for k, g in dups.groupby("_k"):
+            st.markdown(f"**linkedin.com/in/{k}**  \n" + "  \n".join("• " + who(r) for _, r in g.iterrows()))
+        st.caption("Xoá dòng thừa trong Google Sheet (tab leads), rồi bấm Tải lại dữ liệu.")
 if df.empty:
-    st.info("Sheet đang trống. Kiểm tra tab **leads** trong Google Sheet đã có dữ liệu chưa, hoặc vào trang **Thêm lead LinkedIn** để thêm lead.")
+    st.info("Sheet đang trống. Kiểm tra tab **leads** trong Google Sheet đã có dữ liệu chưa, hoặc vào trang **Thêm lead** để thêm lead.")
 
 # ===== Lead của tôi =====
 if page.endswith("Lead của tôi"):
@@ -508,50 +579,95 @@ elif page.endswith("Tra công ty"):
     else:
         st.caption(f"{len(counts)} công ty · {len(df)} người liên hệ")
 
-# ===== Thêm lead LinkedIn =====
-elif page.endswith("Thêm lead LinkedIn"):
-    st.title("Thêm lead từ LinkedIn")
-    st.markdown("Dán link LinkedIn, **mỗi dòng 1 người**. Có thể dán kèm thông tin, cách nhau bằng dấu `|` hoặc Tab:  \n"
-                "`link | Tên | Chức danh | Công ty` — thiếu thì để trống, gõ tay sau trong bảng.")
-    txt = st.text_area("Link LinkedIn", height=180, label_visibility="collapsed",
-                       placeholder="https://www.linkedin.com/in/nguyen-van-a\nhttps://www.linkedin.com/in/tran-thi-b | Trần Thị B | HR Director | Jollibee Vietnam")
-    c1, c2 = st.columns([2, 3])
-    company_all = c1.text_input("Công ty chung (nếu cả list cùng 1 công ty)")
-    members = c2.multiselect("Chia ngẫu nhiên cho", TEAM, default=TEAM)
+# ===== Thêm lead =====
+elif page.endswith("Thêm lead"):
+    st.title("Thêm lead")
+    tab_link, tab_one = st.tabs([":material/add_link: Dán nhiều link LinkedIn", ":material/edit: Nhập tay 1 lead"])
 
-    existing = set(df.linkedin.map(norm_linkedin)) - {""}
-    parsed, dup = [], 0
-    for line in txt.splitlines():
-        parts = [p.strip() for p in re.split(r"\t|\|", line)]
-        link = next((p for p in parts if "linkedin.com" in p.lower()), "")
-        if not link:
-            continue
-        rest = [p for p in parts if p != link]
-        link = norm_linkedin(link)
-        if link in existing or any(p["linkedin"] == link for p in parsed):
-            dup += 1
-            continue
-        parsed.append({"linkedin": link, "name": rest[0] if len(rest) > 0 else "",
-                       "title": rest[1] if len(rest) > 1 else "",
-                       "company": (rest[2] if len(rest) > 2 else "") or company_all.strip()})
-    if txt.strip():
-        st.caption(f"Đọc được **{len(parsed)}** link mới" + (f" · bỏ qua {dup} link đã có/trùng" if dup else ""))
-        if parsed:
-            st.dataframe(pd.DataFrame(parsed).rename(columns={"linkedin": "LinkedIn", "name": "Tên", "title": "Chức danh", "company": "Công ty"}),
-                         hide_index=True, width="stretch",
-                         column_config={"LinkedIn": st.column_config.LinkColumn(display_text=r"https?://(?:www\.)?linkedin\.com/in/([^/?#]+).*")})
-    if st.button(f"Thêm {len(parsed)} lead & chia ngẫu nhiên", type="primary", disabled=not parsed or not members):
-        now = datetime.now().isoformat(timespec="seconds")
-        recs = [{**p, "id": uuid.uuid4().hex[:10], "stage": "Lead", "detail": "No Action", "created_at": now} for p in parsed]
-        split = random_split([r["id"] for r in recs], members)
-        for r in recs:
-            r["pic"] = split[r["id"]]
-        get_store().append(recs)
-        load_df.clear()
-        st.session_state.ver = st.session_state.get("ver", 0) + 1
-        result = pd.Series([r["pic"] for r in recs]).value_counts()
-        st.session_state.flash = "Đã thêm & chia: " + ", ".join(f"{k} {v}" for k, v in result.items())
-        st.rerun()
+    with tab_one:
+        with st.form("add_one", clear_on_submit=True):
+            a1, a2 = st.columns(2)
+            n_link = a1.text_input("LinkedIn")
+            n_pic = a2.selectbox("PIC", TEAM + ["Ngẫu nhiên"], index=TEAM.index(me) if me in TEAM else len(TEAM))
+            n_name = a1.text_input("Tên *")
+            n_title = a2.text_input("Chức danh")
+            n_company = a1.text_input("Công ty *")
+            n_detail = a2.selectbox("Trạng thái", DETAILS, index=0)
+            n_email = a1.text_input("Email")
+            n_phone = a2.text_input("Điện thoại")
+            a3, a4, a5 = st.columns(3)
+            n_model = a3.selectbox("Business model", [""] + MODELS)
+            n_size = a4.selectbox("Quy mô", [""] + SIZES)
+            n_domain = a5.selectbox("Ngành", [""] + DOMAINS + sorted(set(df.domain) - set(DOMAINS) - {""}))
+            n_signal = st.text_area("Signal", height=70)
+            if st.form_submit_button("Thêm lead", type="primary", icon=":material/add:"):
+                link = norm_linkedin(n_link)
+                d = find_dup(df, link) if link else None
+                if not (n_name.strip() or link) or not n_company.strip():
+                    st.error("Cần có Công ty và ít nhất Tên hoặc link LinkedIn.")
+                elif d is not None:
+                    st.error(f"⚠️ Link LinkedIn này đã có: {who(d)}. Không thêm trùng.")
+                else:
+                    pic = random.choice(TEAM) if n_pic == "Ngẫu nhiên" else n_pic
+                    rec = {"id": uuid.uuid4().hex[:10], "linkedin": link, "name": n_name.strip(), "title": n_title.strip(),
+                           "company": n_company.strip(), "email": n_email.strip(), "phone": n_phone.strip(), "pic": pic,
+                           "detail": n_detail, "stage": DETAIL_STAGE[n_detail], "model": n_model, "size": n_size,
+                           "domain": n_domain, "signal": n_signal.strip(),
+                           "created_at": datetime.now().isoformat(timespec="seconds"), "last_action": date.today().isoformat()}
+                    get_store().append([rec])
+                    load_df.clear()
+                    st.session_state.ver = st.session_state.get("ver", 0) + 1
+                    st.session_state.flash = f"Đã thêm {rec['name'] or rec['linkedin']} – {rec['company']} cho {pic}."
+                    st.rerun()
+
+    with tab_link:
+        st.markdown("Dán link LinkedIn, **mỗi dòng 1 người**. Có thể dán kèm thông tin, cách nhau bằng dấu `|` hoặc Tab:  \n"
+                    "`link | Tên | Chức danh | Công ty` — thiếu thì để trống, gõ tay sau trong bảng.")
+        txt = st.text_area("Link LinkedIn", height=180, label_visibility="collapsed",
+                           placeholder="https://www.linkedin.com/in/nguyen-van-a\nhttps://www.linkedin.com/in/tran-thi-b | Trần Thị B | HR Director | Jollibee Vietnam")
+        c1, c2 = st.columns([2, 3])
+        company_all = c1.text_input("Công ty chung (nếu cả list cùng 1 công ty)")
+        members = c2.multiselect("Chia ngẫu nhiên cho", TEAM, default=TEAM)
+
+        existing = {li_key(u): r for u, (_, r) in zip(df.linkedin, df.iterrows()) if li_key(u)}
+        parsed, dups_in = [], []
+        for line in txt.splitlines():
+            parts = [p.strip() for p in re.split(r"\t|\|", line)]
+            link = next((p for p in parts if "linkedin.com" in p.lower()), "")
+            if not link:
+                continue
+            rest = [p for p in parts if p != link]
+            link = norm_linkedin(link)
+            k = li_key(link)
+            if k in existing:
+                dups_in.append(f"**{k}** đã có: {who(existing[k])}")
+                continue
+            if any(li_key(p["linkedin"]) == k for p in parsed):
+                dups_in.append(f"**{k}** bị dán 2 lần trong danh sách này")
+                continue
+            parsed.append({"linkedin": link, "name": rest[0] if len(rest) > 0 else "",
+                           "title": rest[1] if len(rest) > 1 else "",
+                           "company": (rest[2] if len(rest) > 2 else "") or company_all.strip()})
+        if txt.strip():
+            st.caption(f"Đọc được **{len(parsed)}** link mới")
+            if dups_in:
+                st.warning(f"⚠️ {len(dups_in)} link bị trùng — sẽ KHÔNG thêm:  \n" + "  \n".join("• " + x for x in dups_in))
+            if parsed:
+                st.dataframe(pd.DataFrame(parsed).rename(columns={"linkedin": "LinkedIn", "name": "Tên", "title": "Chức danh", "company": "Công ty"}),
+                             hide_index=True, width="stretch",
+                             column_config={"LinkedIn": st.column_config.LinkColumn(display_text=r"https?://(?:www\.)?linkedin\.com/in/([^/?#]+).*")})
+        if st.button(f"Thêm {len(parsed)} lead & chia ngẫu nhiên", type="primary", disabled=not parsed or not members):
+            now = datetime.now().isoformat(timespec="seconds")
+            recs = [{**p, "id": uuid.uuid4().hex[:10], "stage": "Lead", "detail": "No Action", "created_at": now} for p in parsed]
+            split = random_split([r["id"] for r in recs], members)
+            for r in recs:
+                r["pic"] = split[r["id"]]
+            get_store().append(recs)
+            load_df.clear()
+            st.session_state.ver = st.session_state.get("ver", 0) + 1
+            result = pd.Series([r["pic"] for r in recs]).value_counts()
+            st.session_state.flash = "Đã thêm & chia: " + ", ".join(f"{k} {v}" for k, v in result.items())
+            st.rerun()
 
 # ===== Cả team =====
 else:
@@ -574,11 +690,19 @@ else:
             st.rerun()
 
     f1, f2 = st.columns([1, 2])
-    who = f1.selectbox("PIC", ["Tất cả"] + TEAM + ["(chưa chia)"])
+    pic_f = f1.selectbox("PIC", ["Tất cả"] + TEAM + ["(chưa chia)"])
     q = f2.text_input("Tìm", placeholder="Tìm tên, công ty…", key="team_q")
-    show = df if who == "Tất cả" else df[df.pic == ("" if who == "(chưa chia)" else who)]
+    show = df if pic_f == "Tất cả" else df[df.pic == ("" if pic_f == "(chưa chia)" else pic_f)]
     if q:
         ql = q.lower()
         show = show[[ql in f"{n} {c} {t}".lower() for n, c, t in zip(show["name"], show["company"], show["title"])]]
     lead_table(show.sort_values(["company", "name"]), "team")
     detail_form(show, "team")
+
+    with st.expander("Xoá nhiều lead cùng lúc", icon=":material/delete_sweep:"):
+        lab = {r.id: f"{r.name or '(chưa có tên)'} — {r.company} ({r.pic or 'chưa chia'})" for r in show.itertuples()}
+        pick = st.multiselect("Chọn lead cần xoá", list(lab), format_func=lab.get, key="bulk_del")
+        ok = st.checkbox(f"Tôi chắc chắn muốn xoá {len(pick)} lead này", key="bulk_ok")
+        if st.button(f"Xoá {len(pick)} lead", disabled=not (pick and ok), icon=":material/delete:"):
+            delete_leads(pick, f"Đã xoá {len(pick)} lead.")
+            st.rerun()
