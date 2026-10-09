@@ -309,8 +309,8 @@ def lead_table(df, key, hide=()):
         "PIC": df["pic"].values,
         "Trạng thái": df["detail"].values,
         **{label: df[k].map(lambda v: bool(parse_d(v))).values for k, label, _, _ in STEPS},
-        "Hạn nhắc": df.apply(due_label, axis=1).values,
-        "Gần nhất": df.apply(last_step, axis=1).values,
+        "Hạn nhắc": [due_label(r) for _, r in df.iterrows()],
+        "Gần nhất": [last_step(r) for _, r in df.iterrows()],
     })
     pics = TEAM + sorted(set(df["pic"]) - set(TEAM) - {""})
     cfg = {
@@ -331,7 +331,7 @@ def lead_table(df, key, hide=()):
     order = [c for c in view.columns if c not in hide]
     editor_key = f"{key}_{st.session_state.get('ver', 0)}"
     st.data_editor(view, key=editor_key, hide_index=True, column_config=cfg, column_order=order,
-                   use_container_width=True, num_rows="fixed",
+                   width="stretch", num_rows="fixed",
                    height=min(38 + 35 * len(view), 640),
                    on_change=on_table_edit, args=(editor_key, ids))
 
@@ -432,12 +432,15 @@ with st.sidebar:
         st.caption(f"Mẹo: lưu lại link trang này, lần sau mở là vào thẳng danh sách của {me}.")
     if isinstance(get_store(), LocalStore):
         st.warning("Đang chạy chế độ thử (lưu vào file CSV). Cấu hình Secrets để dùng Google Sheet.")
-    if st.button("Tải lại dữ liệu", icon=":material/refresh:", use_container_width=True):
+    if st.button("Tải lại dữ liệu", icon=":material/refresh:", width="stretch"):
         load_df.clear()
         st.rerun()
 
 today = date.today()
-df = df.assign(_due=df.apply(next_due, axis=1))
+df = df.copy()
+df["_due"] = [next_due(r) for _, r in df.iterrows()]
+if df.empty:
+    st.info("Sheet đang trống. Kiểm tra tab **leads** trong Google Sheet đã có dữ liệu chưa, hoặc vào trang **Thêm lead LinkedIn** để thêm lead.")
 
 # ===== Lead của tôi =====
 if page.endswith("Lead của tôi"):
@@ -463,7 +466,7 @@ if page.endswith("Lead của tôi"):
     show = {"Tất cả": mine, "Cần nhắc hôm nay": due_now, "Chưa outreach": not_out, "Đang trao đổi": talking}[view]
     if q:
         ql = q.lower()
-        show = show[show[["name", "company", "title"]].apply(lambda r: ql in " ".join(r).lower(), axis=1)]
+        show = show[[ql in f"{n} {c} {t}".lower() for n, c, t in zip(show["name"], show["company"], show["title"])]]
     show = show.assign(_k=show._due.map(lambda d: d or date.max)).sort_values(["_k", "company"])
     st.caption("Tick vào ô là lưu luôn ngày hôm nay. Gõ tên & chức danh trực tiếp vào bảng.")
     lead_table(show, "mine", hide=("PIC",))
@@ -518,7 +521,7 @@ elif page.endswith("Thêm lead LinkedIn"):
         st.caption(f"Đọc được **{len(parsed)}** link mới" + (f" · bỏ qua {dup} link đã có/trùng" if dup else ""))
         if parsed:
             st.dataframe(pd.DataFrame(parsed).rename(columns={"linkedin": "LinkedIn", "name": "Tên", "title": "Chức danh", "company": "Công ty"}),
-                         hide_index=True, use_container_width=True,
+                         hide_index=True, width="stretch",
                          column_config={"LinkedIn": st.column_config.LinkColumn(display_text=r"https?://(?:www\.)?linkedin\.com/in/([^/?#]+).*")})
     if st.button(f"Thêm {len(parsed)} lead & chia ngẫu nhiên", type="primary", disabled=not parsed or not members):
         now = datetime.now().isoformat(timespec="seconds")
@@ -536,11 +539,13 @@ elif page.endswith("Thêm lead LinkedIn"):
 # ===== Cả team =====
 else:
     st.title("Cả team")
+    if df.empty:
+        st.stop()
     stage_of = df.detail.map(lambda d: DETAIL_STAGE.get(d, "Lead"))
     pivot = pd.crosstab(df.pic.replace("", "(chưa chia)"), stage_of).reindex(columns=[s for s in STAGES if s in set(stage_of)], fill_value=0)
     pivot["Cần nhắc hôm nay"] = df.groupby(df.pic.replace("", "(chưa chia)"))._due.apply(lambda s: sum(1 for d in s if d and d <= today))
     pivot["Tổng"] = pivot[[s for s in STAGES if s in pivot.columns]].sum(axis=1)
-    st.dataframe(pivot, use_container_width=True)
+    st.dataframe(pivot, width="stretch")
 
     unassigned = df[df.pic == ""]
     with st.expander(f"Chia ngẫu nhiên lead chưa có PIC ({len(unassigned)})", icon=":material/shuffle:", expanded=bool(len(unassigned))):
@@ -557,6 +562,6 @@ else:
     show = df if who == "Tất cả" else df[df.pic == ("" if who == "(chưa chia)" else who)]
     if q:
         ql = q.lower()
-        show = show[show[["name", "company", "title"]].apply(lambda r: ql in " ".join(r).lower(), axis=1)]
+        show = show[[ql in f"{n} {c} {t}".lower() for n, c, t in zip(show["name"], show["company"], show["title"])]]
     lead_table(show.sort_values(["company", "name"]), "team")
     detail_form(show, "team")
