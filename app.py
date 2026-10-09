@@ -79,11 +79,19 @@ class SheetStore:
         self.gspread = gspread
         info = json.loads(secret("gcp_json"))
         creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        sh = gspread.authorize(creds).open_by_url(secret("sheet_url"))
-        try:
-            self.ws = sh.worksheet("leads")
-        except gspread.WorksheetNotFound:
-            self.ws = sh.add_worksheet("leads", rows=1000, cols=len(COLUMNS))
+        sh = gspread.authorize(creds).open_by_url(secret("sheet_url").strip())
+        self.sheet_title = sh.title
+        tabs = sh.worksheets()
+        self.tab_names = [w.title for w in tabs]
+        # Ưu tiên tab tên "leads" có dữ liệu; nếu không, lấy tab nào có cột id + name
+        def has_data(w):
+            head = [h.strip().lower() for h in w.row_values(1)]
+            return "id" in head and "name" in head
+        named = [w for w in tabs if w.title.strip().lower() == "leads"]
+        pick = next((w for w in named if has_data(w)), None) or next((w for w in tabs if has_data(w)), None)
+        if pick is None:
+            pick = named[0] if named else sh.add_worksheet("leads", rows=1000, cols=len(COLUMNS))
+        self.ws = pick
         header = [h.strip() for h in self.ws.row_values(1)]
         if not header:
             header = list(COLUMNS)
@@ -434,7 +442,11 @@ with st.sidebar:
         st.warning("Đang chạy chế độ thử (lưu vào file CSV). Cấu hình Secrets để dùng Google Sheet.")
     if st.button("Tải lại dữ liệu", icon=":material/refresh:", width="stretch"):
         load_df.clear()
+        get_store.clear()
         st.rerun()
+    _s = get_store()
+    if isinstance(_s, SheetStore):
+        st.caption(f"Đang đọc: **{_s.sheet_title}** · tab **{_s.ws.title}** · {len(df)} lead  \nCác tab: {', '.join(_s.tab_names)}")
 
 today = date.today()
 df = df.copy()
